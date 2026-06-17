@@ -200,13 +200,15 @@ def _extract_json(text: str) -> dict:
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3]
     text = text.strip()
+    # strict=False tolerates literal control characters (raw newlines/tabs) inside
+    # JSON strings, which the model often emits when a value contains code or markdown.
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
+            return json.loads(text[start : end + 1], strict=False)
         raise
 
 

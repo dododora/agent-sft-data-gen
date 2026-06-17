@@ -1,26 +1,5 @@
 """Generate STITCH-S single-turn training data from the gemma4-agent-sft canon.
 
-The LLM writes the WHOLE trajectory itself. This script only prepares the input
-(splitting the multi-turn conversation into turns and handing the model the real,
-verbatim tool calls/results) and then stores what the model returns. There is no
-code-side template that assembles the trajectory — the model authors every
-<SAY> / [SOPR] chunk and decides the structure, copying the <TOOL_CALL> /
-<TOOL_RESULT> lines verbatim from the input.
-
-Pipeline
---------
-1. Read the multi-turn records from a .jsonl OR .parquet file (see load_records).
-   The raw agent-sft parquet stores `messages`/`tools` as JSON strings and keeps
-   each tool result in a standalone {"role": "tool"} message; load_records parses
-   the strings and folds those tool messages back into the preceding assistant, so
-   the rest of the pipeline always sees the canonical embedded shape.
-2. Split each conversation into individual turns (one user message + the
-   assistant work that answers it, including any tool calls/results).
-3. For every turn build the per-turn INPUT object that prompt.txt expects and ask
-   Gemma 4 to return {"user": <zh-TW question>, "msg": <full STITCH-S trajectory>}.
-4. Flatten the multi-turn conversation into single-turn rows and save them to
-   gemma4-agent-sft/out/ with fields: id, source, user, msg.
-
 Run (needs GOOGLE_API_KEY in .env):
     python gemma4-agent-sft/genData.py            # process the whole file
     python gemma4-agent-sft/genData.py --limit 1  # just the first record
@@ -36,7 +15,6 @@ import json
 import argparse
 import traceback
 
-# callGemma.py lives at the repo root (one level up from this file).
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 if REPO_ROOT not in sys.path:
@@ -50,19 +28,7 @@ OUT_DIR = os.path.join(HERE, "out")
 OUT_PATH = os.path.join(OUT_DIR, "single_turn.jsonl")
 
 
-# --------------------------------------------------------------------------- #
-# Record loading (.jsonl or .parquet) + format normalization
-# --------------------------------------------------------------------------- #
 def _collapse_tool_messages(messages: list[dict]) -> list[dict]:
-    """Fold standalone {"role": "tool"} messages into the preceding assistant.
-
-    The raw agent-sft data stores a tool result as its own message
-    ({"role": "tool", "tool_responses": [...]}) right after the assistant message
-    that holds the matching `tool_calls`. The canonical jsonl (and the rest of this
-    pipeline) instead expects `tool_responses` embedded in that assistant message.
-    This rewrites the former into the latter; already-collapsed input is unchanged
-    (there are no tool-role messages to fold).
-    """
     out: list[dict] = []
     last_assistant: dict | None = None
     for msg in messages:
@@ -71,8 +37,8 @@ def _collapse_tool_messages(messages: list[dict]) -> list[dict]:
                 last_assistant.setdefault("tool_responses", []).extend(
                     msg.get("tool_responses") or []
                 )
-            continue  # drop the standalone tool message
-        msg = dict(msg)  # copy so we never mutate the source record
+            continue
+        msg = dict(msg)
         out.append(msg)
         if msg.get("role") == "assistant":
             last_assistant = msg
@@ -80,11 +46,6 @@ def _collapse_tool_messages(messages: list[dict]) -> list[dict]:
 
 
 def _parse_record(rec: dict) -> dict:
-    """Normalize one raw record into the shape the pipeline expects.
-
-    Parquet stores `messages`/`tools` as JSON strings; parse them if needed, then
-    collapse standalone tool messages into their assistant.
-    """
     rec = dict(rec)
     msgs = rec.get("messages")
     if isinstance(msgs, str):
@@ -98,9 +59,8 @@ def _parse_record(rec: dict) -> dict:
 
 
 def load_records(path: str) -> list[dict]:
-    """Load records from a .jsonl or .parquet file, normalized for the pipeline."""
     if path.endswith(".parquet"):
-        import pyarrow.parquet as pq  # lazy: only needed for parquet input
+        import pyarrow.parquet as pq
 
         table = pq.read_table(path, columns=["id", "source", "messages", "tools"])
         return [_parse_record(row) for row in table.to_pylist()]
@@ -114,109 +74,12 @@ def load_records(path: str) -> list[dict]:
     return records
 
 
-# --------------------------------------------------------------------------- #
-# System prompt: reuse prompt.txt's rules and ask for the FULL trajectory in one
-# {user, msg} object. The model authors the whole `msg`.
-# --------------------------------------------------------------------------- #
-# The complete worked example (exactly the trajectory the user wants the model to
-# emit). Built as a real string, then JSON-encoded so the model sees valid,
-# properly escaped JSON in the prompt.
-_EXAMPLE_MSG = """<SAY>沒問題，要精準地記錄馬拉松的官方起跑時刻，時間當然一定要抓得非常標準。我馬上幫您查詢目前系統的即時標準時間，確保資訊是正確的。</SAY>
-
-[SOPR]Task: get exact current datetime for marathon official start. Next: call time_mcp_server_current_time with format YYYY-MM-DD HH:mm:ss.[EOPR]
-
-<TOOL_CALL>{"function": {"name": "time_mcp_server_current_time", "arguments": {"format": "YYYY-MM-DD HH:mm:ss"}}}</TOOL_CALL>
-
-<SAY>我正在向時間服務查詢目前標準的時間，會用到秒的精準度。請您稍微等一下，拿到之後就直接給您可以記錄的完整時刻。</SAY>
-
-<TOOL_RESULT>{"name": "time_mcp_server_current_time", "response": "Current UTC time is 2025-08-27 23:23:29, and the time in UTC is 2025-08-27 23:23:29."}</TOOL_RESULT>
-
-[SOPR]The tool result provides the exact UTC time: 2025-08-27 23:23:29. This is the official start moment, which can now be reported to the user.[EOPR]
-[EOR]
-<SAY>您馬拉松的官方起跑時刻是 **2025-08-27 23:23:29 UTC**。請直接將這個時間作為您的參考起跑點；如果您的報名系統或當地要求使用台灣時區，記得要再做換算喔。</SAY>"""
-
-_EXAMPLE_INPUT = json.dumps(
-    {
-        "language": "zh-TW",
-        "context": [],
-        "user": "Could you provide the exact current date and time so I can record the official start moment for the marathon?",
-        "available_tools": [
-            {"name": "time_mcp_server_current_time", "description": "Get the current date and time."}
-        ],
-        "tool_steps": [
-            {
-                "order": 1,
-                "tool_call_line": '<TOOL_CALL>{"function": {"name": "time_mcp_server_current_time", "arguments": {"format": "YYYY-MM-DD HH:mm:ss"}}}</TOOL_CALL>',
-                "tool_result_line": '<TOOL_RESULT>{"name": "time_mcp_server_current_time", "response": "Current UTC time is 2025-08-27 23:23:29, and the time in UTC is 2025-08-27 23:23:29."}</TOOL_RESULT>',
-            }
-        ],
-        "reference_answer": "The official start moment for your marathon is 2025-08-27 23:23:29 UTC.",
-    },
-    ensure_ascii=False,
-    indent=2,
-)
-
-_EXAMPLE_OUTPUT = json.dumps(
-    {
-        "user": "可以幫我查一下現在的確切日期與時間，我想拿來記錄馬拉松的官方起跑時刻嗎？",
-        "msg": _EXAMPLE_MSG,
-    },
-    ensure_ascii=False,
-)
-
-DIRECT_OUTPUT_CONTRACT = f"""## Output format (READ CAREFULLY)
-
-You write the WHOLE trajectory yourself and return it as a single string, together with the user's
-question translated into Traditional Chinese.
-
-Return valid JSON ONLY, exactly this shape (no markdown, no commentary):
-
-{{
-  "user": "<the user's question translated into natural Traditional Chinese (zh-TW)>",
-  "msg": "<the complete STITCH-S trajectory as a single string>"
-}}
-
-Build `msg` by following the "Canonical chunk cycle" and "Markup" rules above, splicing each step's
-`tool_call_line` and `tool_result_line` in VERBATIM where the cycle places <TOOL_CALL> / <TOOL_RESULT>.
-String serialization:
-- Separate chunks with a blank line.
-- Write the closing exactly as `[EOPR]\\n[EOR]\\n<SAY>...`: the final [SOPR] block, then [EOR], then the
-  final <SAY>, each on its own line and with no blank line inside the closing.
-- If `tool_steps` is empty, `msg` is an opening <SAY> followed by that same closing block, with no
-  <TOOL_CALL> / <TOOL_RESULT> in between.
-
-## One complete example
-
-INPUT:
-{_EXAMPLE_INPUT}
-
-OUTPUT:
-{_EXAMPLE_OUTPUT}
-"""
-
-
 def build_system_prompt() -> str:
-    """Combine prompt.txt's STITCH-S rules with the direct output contract.
-
-    prompt.txt owns all the rules (language, markup, chunk cycle, constraints);
-    DIRECT_OUTPUT_CONTRACT owns only the {user, msg} output shape, the string
-    serialization details, and the worked example. Neither side re-defines the
-    other's content, so this is a plain concatenation.
-    """
     with open(PROMPT_PATH, encoding="utf-8") as f:
-        return f.read().rstrip() + "\n\n" + DIRECT_OUTPUT_CONTRACT
+        return f.read().rstrip()
 
 
-# --------------------------------------------------------------------------- #
-# Turn splitting / input preparation
-# --------------------------------------------------------------------------- #
 def split_turns(messages: list[dict]) -> list[dict]:
-    """Group a flat message list into turns.
-
-    A turn = one user message followed by every assistant message up to (but not
-    including) the next user message. A leading `system` message is captured as
-    extra context for the whole conversation.
-    """
     turns: list[dict] = []
     system_text = ""
     current: dict | None = None
@@ -244,12 +107,6 @@ def split_turns(messages: list[dict]) -> list[dict]:
 
 
 def collect_tool_steps(assistant_messages: list[dict]) -> list[dict]:
-    """Pair every tool_call with its tool_response across the turn's messages.
-
-    Each step carries the exact verbatim markup lines the model must embed. Tool
-    calls without a recorded response are dropped (a STITCH-S trajectory needs a
-    result and we must never fabricate one).
-    """
     steps: list[dict] = []
     for msg in assistant_messages:
         calls = msg.get("tool_calls") or []
@@ -272,7 +129,6 @@ def collect_tool_steps(assistant_messages: list[dict]) -> list[dict]:
 
 
 def reference_answer_of(assistant_messages: list[dict]) -> str:
-    """The last non-empty assistant content is the ground-truth final answer."""
     for msg in reversed(assistant_messages):
         content = msg.get("content")
         if content and content.strip():
@@ -295,7 +151,6 @@ def build_model_input(
     available_tools: list[dict],
     context: list[dict],
 ) -> dict:
-    """Assemble the per-turn INPUT object handed to the model."""
     payload = {
         "language": "zh-TW",
         "context": context,
@@ -316,9 +171,6 @@ def build_model_input(
     return payload
 
 
-# --------------------------------------------------------------------------- #
-# Light validation (warn only — we never rewrite the model's trajectory)
-# --------------------------------------------------------------------------- #
 _SAY_RE = re.compile(r"<SAY>(.*?)</SAY>", re.S)
 
 
@@ -343,18 +195,14 @@ def validate_msg(msg: str, tool_steps: list[dict], where: str) -> None:
             )
 
 
-# --------------------------------------------------------------------------- #
-# Driver
-# --------------------------------------------------------------------------- #
 def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
-    """Turn one multi-turn conversation into a list of single-turn output rows."""
     rows: list[dict] = []
     rec_id = record.get("id", "unknown")
     source = record.get("source", "unknown")
     tools = available_tools_of(record)
     turns = split_turns(record.get("messages", []))
 
-    context: list[dict] = []  # accumulated zh-TW context from earlier turns
+    context: list[dict] = []
 
     for t_idx, turn in enumerate(turns):
         if not (turn.get("user") or "").strip():
@@ -363,11 +211,6 @@ def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
         reference_answer = reference_answer_of(turn["assistant_messages"])
 
         if not tool_steps and not reference_answer:
-            # Keep a turn if it has EITHER tool steps OR a reference answer. Tool
-            # call+result alone is enough (no assistant text needed — constraint #10
-            # synthesizes the closing). Only skip when there is nothing to ground a
-            # trajectory on (e.g. apigen: tool_calls with no recorded result and no
-            # text answer). Skip rather than hallucinate.
             print(
                 f"  [warn] turn {t_idx} of {rec_id}: no tool results and no "
                 f"reference answer, skipping",
@@ -388,7 +231,7 @@ def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
         try:
             raw = call_gemma(prompt, system=system_prompt, model=model, fmt="json")
             obj = _extract_json(raw)
-        except Exception as exc:  # noqa: BLE001 - keep the run going
+        except Exception as exc:  # noqa: BLE001
             print(f"  [warn] {where} failed: {exc}", file=sys.stderr)
             continue
 
@@ -406,10 +249,10 @@ def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
                 "source": source,
                 "user": user_zh,
                 "msg": msg,
+                "input": model_input,
             }
         )
 
-        # Feed this turn forward as zh-TW context for the next turn.
         context.append({"user": user_zh, "assistant": last_say(msg)})
 
     return rows
@@ -423,7 +266,7 @@ def main() -> None:
     parser.add_argument("--out", default=OUT_PATH, help="Single-turn .jsonl output.")
     parser.add_argument(
         "--model",
-        default=os.environ.get("GEMMA_MODEL", "gemma-4-26b-a4b-it"),
+        default=os.environ.get("GEMMA_MODEL", "gemma-4-31b-it"),
         help="Gemini API model id to use.",
     )
     parser.add_argument(
@@ -435,7 +278,6 @@ def main() -> None:
     args = parser.parse_args()
 
     system_prompt = build_system_prompt()
-
     records = load_records(args.data)
 
     selected = records[args.start :]
