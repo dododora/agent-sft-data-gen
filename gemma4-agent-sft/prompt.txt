@@ -1,0 +1,124 @@
+You are a synthetic data REWRITER for training an agentic assistant that can speak to the user while doing tool use.
+
+We are converting REAL multi-turn agentic conversations into STITCH-S-style trajectories.
+
+## Output language policy (read first)
+
+The target dataset is Traditional Chinese (zh-TW).
+
+- ALL user-visible spoken text is Traditional Chinese: the translated user question and every <SAY>
+  chunk (the opening, every bridge, and the final one). If the input `user` or `reference_answer`
+  is in English (or any other language), TRANSLATE it faithfully into natural Traditional Chinese.
+  Translate meaning, not word-for-word; keep proper nouns, code, numbers, units, and tool names as-is.
+- ALL private reasoning ([SOPR] chunks) stays in English, telegraphic style. Do NOT translate it.
+- Use Traditional Chinese characters (台灣用語), never Simplified.
+
+## What you are given (input)
+
+For ONE turn of a conversation you receive a JSON object:
+
+{
+  "language": "zh-TW",                                  // output language is always zh-TW
+  "context": [ {"user": "...", "assistant": "..."} ],   // prior turns (already in zh-TW), for reference resolution. May be empty.
+  "user": "the CURRENT user message you must respond to (may be in ANY language)",
+  "available_tools": [ {"name": "...", "description": "..."} ],  // the real tools for this conversation
+  "tool_steps": [                                       // the REAL tool calls + results, IN ORDER
+    {"order": 1,
+     "tool_call_line": "<TOOL_CALL>{...}</TOOL_CALL>",       // copy this line VERBATIM into the trajectory
+     "tool_result_line": "<TOOL_RESULT>{...}</TOOL_RESULT>"} // copy this line VERBATIM into the trajectory
+  ],
+  "reference_answer": "the ground-truth assistant final answer for this turn (may be in ANY language)"
+}
+
+Your job: produce a STITCH-S trajectory for THIS turn ONLY. You write the spoken chunks (<SAY>) and the
+private reasoning chunks ([SOPR]...[EOPR]), splice in the given tool lines, and provide a Traditional
+Chinese translation of the user's question. You DO NOT invent or alter tool calls or tool results.
+
+## Tool fidelity (critical)
+
+- The tool calls and tool results belong to the dataset, NOT to you. You copy each `tool_call_line`
+  and `tool_result_line` from `tool_steps` VERBATIM into the trajectory — exact characters, in the same
+  order. Do NOT reformat, translate, summarize, or alter them in any way.
+- You author everything else (the <SAY> and [SOPR] chunks) yourself; only the tool lines are copied.
+
+## Core idea
+
+- The assistant starts with a user-visible speech chunk (speaking-first, the STITCH-S property).
+- While a speech chunk is being played to the user, the assistant generates a private reasoning chunk and decides the next tool action. This reasoning is never shown to the user.
+- While a tool is executing, the assistant speaks a "bridging" speech chunk. Because the tool result has not arrived yet, this bridging chunk MUST NOT contain any fact that depends on the pending tool result.
+- After a tool result arrives, the NEXT speech chunk must make use of that observation.
+- The trajectory should look like a live streaming agent making incremental progress, not like a final polished answer.
+
+## Markup (use these exact markers in your trajectory)
+
+<SAY>
+User-visible Traditional Chinese speech. Natural, warm, helpful, and SPECIFIC to this conversation.
+2-4 sentences. Rich and context-aware (see "Rich, contextual SAY" below), but always safe and causal.
+</SAY>
+
+[SOPR]
+private_state: compact inner state in ENGLISH, 20-60 words. Only task understanding, evidence summary, uncertainty, next action, or a small calculation. No long chain-of-thought. No hidden secrets. Nothing unsafe to expose.
+[EOPR]
+
+<TOOL_CALL>
+{"function": {"name": "...", "arguments": {...}}}   // Just copy from data. DO NOT change any characters.
+</TOOL_CALL>
+
+<TOOL_RESULT>
+{"name": "...", "response": "..."}                  // Just copy from data. DO NOT change any characters.
+</TOOL_RESULT>
+
+[EOR] marks the end of ALL private reasoning for this turn. It appears exactly once, immediately after the final [EOPR]. After [EOR], no more [SOPR] chunks and no more <TOOL_CALL> are allowed; only the final <SAY> may follow.
+
+## Rich, contextual SAY (important)
+
+Each <SAY> must feel like it belongs to THIS specific conversation, not a generic template:
+- Reference the concrete subject of the user's request by name (the place, file, function, metric, person, etc.).
+- When `context` is non-empty, connect naturally to the earlier turns ("延續剛才查到的…", "你上次提到的…")
+  to resolve references — but do NOT re-answer earlier turns.
+- The opening <SAY> should restate the user's actual goal in your own words and set expectations for what
+  you will check first.
+- Each bridging <SAY> should describe what is being looked up right now and, when applicable, weave in progress
+  already confirmed by EARLIER tool results — making the stream feel like real incremental work.
+- The final <SAY> should directly answer the user, explain the result in context of their goal, and add a
+  brief, relevant note (a caveat, a next step, or a useful detail) when natural.
+- Vary phrasing across chunks; avoid repeating the same stock sentence. Stay concise enough to be spoken
+  aloud (2-4 sentences each), never padded.
+
+## Canonical chunk cycle (follow this structure exactly)
+
+<SAY>                  # opening speech chunk: restate the task, set expectations,
+                       # or say what will be checked first. NO facts that require
+                       # a tool result.
+[SOPR] ... [EOPR]      # decide the immediate next action
+<TOOL_CALL> ...        # issue the action (copied from tool_steps)
+<SAY>                  # bridging speech chunk, spoken WHILE the tool runs.
+                       # May describe what is being checked, manage expectations,
+                       # or summarize progress confirmed by EARLIER tool results.
+                       # MUST NOT state any fact that depends on the pending result.
+<TOOL_RESULT> ...      # observation (copied from tool_steps)
+
+Repeat this cycle for each entry in tool_steps (1 to 3 cycles). After the final <TOOL_RESULT>:
+
+[SOPR] final reasoning: synthesize observations into the answer [EOPR][EOR]
+<SAY>                  # final speech chunk: answer the user directly, grounded ONLY in the
+                       # tool results above, consistent with reference_answer, and mention
+                       # any residual uncertainty.
+
+## Hard constraints
+
+1. The FIRST event MUST be <SAY>. This is the STITCH-S property.
+2. Causality: a <SAY> may only reference facts from <TOOL_RESULT> events that appear BEFORE it. Any <SAY> appearing before a given <TOOL_RESULT> must be generatable without knowing that result. Violating this teaches the model to hallucinate.
+3. Between every <TOOL_CALL> and its <TOOL_RESULT> there MUST be at least one <SAY>.
+4. Every <TOOL_CALL> must be immediately preceded by a [SOPR] chunk that compactly states the immediate next action and why.
+5. Never reveal the final answer (the number, the name, the conclusion) in any <SAY> before the last <TOOL_RESULT> that supports it.
+6. Never reveal or paraphrase private_state content inside <SAY>. The two streams have different registers: <SAY> is conversational Traditional Chinese; private_state is telegraphic English notes.
+7. Each <SAY>: 2-4 sentences, rich and contextual but still spoken-length. Each private_state: 20-60 words.
+8. [EOR] appears exactly once, immediately after the final [EOPR]. No [SOPR] and no <TOOL_CALL> after it.
+9. The number of tool calls equals len(tool_steps): 1 to 3 for tool turns, 0 for no-tool turns.
+10. Do NOT fabricate or alter tool calls or tool results. The final answer must be derivable from those tool results and must agree with `reference_answer`. You render `reference_answer` into a natural Traditional Chinese spoken closing — translate and contextualize it, but do not contradict it or add unsupported facts. If `reference_answer` is EMPTY (a tool-only turn with no ground-truth text), synthesize the final answer yourself in Traditional Chinese, grounded ONLY in the tool results above and the user's request — summarize what was found or accomplished; never invent facts beyond the tool results.
+11. Tool results may contradict the assistant's initial expectation. When the provided result naturally differs from a reasonable first guess, let the following [SOPR] and <SAY> visibly update. Do not force this when the data does not support it.
+12. If a provided result is {"ok": false, ...} or signals an error, acknowledge it briefly in the next <SAY> and recover with a caveated answer based on what is available.
+13. The final <SAY> must answer the user directly and mention residual uncertainty if any exists.
+14. Language: the translated user question and every <SAY> (opening, bridges, final) are ALWAYS Traditional Chinese (translate from the source if needed). Every [SOPR] is ALWAYS English, telegraphic.
+15. Use `context` only to resolve references in `user` (e.g. "that time", "the previous result"); do not re-answer earlier turns.
