@@ -9,8 +9,11 @@ code-side template that assembles the trajectory — the model authors every
 
 Pipeline
 --------
-1. Read the multi-turn canonical records from
-   gemma4-agent-sft/canonical/small_data.jsonl
+1. Read the multi-turn records from a .jsonl OR .parquet file (see load_records).
+   The raw agent-sft parquet stores `messages`/`tools` as JSON strings and keeps
+   each tool result in a standalone {"role": "tool"} message; load_records parses
+   the strings and folds those tool messages back into the preceding assistant, so
+   the rest of the pipeline always sees the canonical embedded shape.
 2. Split each conversation into individual turns (one user message + the
    assistant work that answers it, including any tool calls/results).
 3. For every turn build the per-turn INPUT object that prompt.txt expects and ask
@@ -21,6 +24,7 @@ Pipeline
 Run (needs GOOGLE_API_KEY in .env):
     python gemma4-agent-sft/genData.py            # process the whole file
     python gemma4-agent-sft/genData.py --limit 1  # just the first record
+    python gemma4-agent-sft/genData.py --data path/to/shard-00000.parquet
 """
 
 from __future__ import annotations
@@ -44,6 +48,70 @@ DATA_PATH = os.path.join(HERE, "gemma4-agent-sft", "canonical", "small_data.json
 PROMPT_PATH = os.path.join(HERE, "prompt.txt")
 OUT_DIR = os.path.join(HERE, "out")
 OUT_PATH = os.path.join(OUT_DIR, "single_turn.jsonl")
+
+
+# --------------------------------------------------------------------------- #
+# Record loading (.jsonl or .parquet) + format normalization
+# --------------------------------------------------------------------------- #
+def _collapse_tool_messages(messages: list[dict]) -> list[dict]:
+    """Fold standalone {"role": "tool"} messages into the preceding assistant.
+
+    The raw agent-sft data stores a tool result as its own message
+    ({"role": "tool", "tool_responses": [...]}) right after the assistant message
+    that holds the matching `tool_calls`. The canonical jsonl (and the rest of this
+    pipeline) instead expects `tool_responses` embedded in that assistant message.
+    This rewrites the former into the latter; already-collapsed input is unchanged
+    (there are no tool-role messages to fold).
+    """
+    out: list[dict] = []
+    last_assistant: dict | None = None
+    for msg in messages:
+        if msg.get("role") == "tool":
+            if last_assistant is not None:
+                last_assistant.setdefault("tool_responses", []).extend(
+                    msg.get("tool_responses") or []
+                )
+            continue  # drop the standalone tool message
+        msg = dict(msg)  # copy so we never mutate the source record
+        out.append(msg)
+        if msg.get("role") == "assistant":
+            last_assistant = msg
+    return out
+
+
+def _parse_record(rec: dict) -> dict:
+    """Normalize one raw record into the shape the pipeline expects.
+
+    Parquet stores `messages`/`tools` as JSON strings; parse them if needed, then
+    collapse standalone tool messages into their assistant.
+    """
+    rec = dict(rec)
+    msgs = rec.get("messages")
+    if isinstance(msgs, str):
+        msgs = json.loads(msgs) if msgs else []
+    tools = rec.get("tools")
+    if isinstance(tools, str):
+        tools = json.loads(tools) if tools else []
+    rec["messages"] = _collapse_tool_messages(msgs or [])
+    rec["tools"] = tools or []
+    return rec
+
+
+def load_records(path: str) -> list[dict]:
+    """Load records from a .jsonl or .parquet file, normalized for the pipeline."""
+    if path.endswith(".parquet"):
+        import pyarrow.parquet as pq  # lazy: only needed for parquet input
+
+        table = pq.read_table(path, columns=["id", "source", "messages", "tools"])
+        return [_parse_record(row) for row in table.to_pylist()]
+
+    records: list[dict] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(_parse_record(json.loads(line)))
+    return records
 
 
 # --------------------------------------------------------------------------- #
@@ -294,6 +362,19 @@ def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
         tool_steps = collect_tool_steps(turn["assistant_messages"])
         reference_answer = reference_answer_of(turn["assistant_messages"])
 
+        if not tool_steps and not reference_answer:
+            # Keep a turn if it has EITHER tool steps OR a reference answer. Tool
+            # call+result alone is enough (no assistant text needed — constraint #10
+            # synthesizes the closing). Only skip when there is nothing to ground a
+            # trajectory on (e.g. apigen: tool_calls with no recorded result and no
+            # text answer). Skip rather than hallucinate.
+            print(
+                f"  [warn] turn {t_idx} of {rec_id}: no tool results and no "
+                f"reference answer, skipping",
+                file=sys.stderr,
+            )
+            continue
+
         model_input = build_model_input(
             turn, tool_steps, reference_answer, tools, list(context)
         )
@@ -336,7 +417,9 @@ def process_record(record: dict, system_prompt: str, model: str) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", default=DATA_PATH, help="Canonical .jsonl input.")
+    parser.add_argument(
+        "--data", default=DATA_PATH, help="Input records (.jsonl or .parquet)."
+    )
     parser.add_argument("--out", default=OUT_PATH, help="Single-turn .jsonl output.")
     parser.add_argument(
         "--model",
@@ -353,12 +436,7 @@ def main() -> None:
 
     system_prompt = build_system_prompt()
 
-    records: list[dict] = []
-    with open(args.data, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    records = load_records(args.data)
 
     selected = records[args.start :]
     if args.limit is not None:
